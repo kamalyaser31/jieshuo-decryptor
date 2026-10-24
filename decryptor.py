@@ -557,6 +557,14 @@ def decrypt_lua_buffer(data: bytes) -> tuple[bytes, str]:
             except Exception:
                 continue
 
+    m_load = re.search(
+        rb'(?:load|loadstring)\s*\(\s*(?:["\']|\[=*\[)\s*(=[A-Za-z0-9+/=]+)',
+        data,
+    )
+    if m_load:
+        dec, m_name = decrypt_lua_buffer(m_load.group(1))
+        return dec, f"load wrapper -> {m_name}"
+
     res = unpack_decimal_array_packer(data)
     if res:
         return res
@@ -583,9 +591,7 @@ def score_candidate(cand_bytes: bytes, raw_bytes: bytes) -> float:
         return -10000.0 * bad_ctrl
 
     has_latin = any("a" <= c.lower() <= "z" for c in s)
-    has_arabic = any(
-        "\u0600" <= c <= "\u06ff" or "\u0750" <= c <= "\u077f" for c in s
-    )
+    has_arabic = any("\u0600" <= c <= "\u06ff" or "\u0750" <= c <= "\u077f" for c in s)
     has_cyrillic = any("\u0400" <= c <= "\u052f" for c in s)
     has_cjk = any("\u4e00" <= c <= "\u9fff" or "\u3040" <= c <= "\u30ff" for c in s)
     if (
@@ -644,16 +650,14 @@ def score_candidate(cand_bytes: bytes, raw_bytes: bytes) -> float:
             (s[0].islower() or s[0] == "_")
             and any(c.isupper() for c in s)
             and not any(
-                s[i].isupper() and s[i + 1].isupper()
-                for i in range(len(s) - 1)
+                s[i].isupper() and s[i + 1].isupper() for i in range(len(s) - 1)
             )
         )
         is_pascal = (
             s[0].isupper()
             and any(c.islower() for c in s)
             and not any(
-                s[i].isupper() and s[i + 1].isupper()
-                for i in range(len(s) - 1)
+                s[i].isupper() and s[i + 1].isupper() for i in range(len(s) - 1)
             )
         )
         is_snake = "_" in s and (s.islower() or s.isupper())
@@ -716,8 +720,9 @@ class BytecodePatcher:
         self.replacements: list[tuple[int, bytes]] = []
 
     def read_bytes(self, n: int = 1) -> bytes:
-        end_pos = self.pos + n
-        res = bytes(self.data[self.pos:end_pos])
+        p = self.pos
+        end_pos = p + n
+        res = bytes(self.data[p:end_pos])
         self.pos = end_pos
         return res
 
@@ -851,7 +856,8 @@ def unpack_cbc_xor(ct: bytes, key: bytes, iv: bytes) -> bytes:
     pt = bytearray()
     k_16 = key[:16]
     for i in range(0, len(ct), bs):
-        blk = ct[i:i + bs]
+        end_idx = i + bs
+        blk = ct[i:end_idx]
         if len(blk) < bs:
             blk = blk + b"\x00" * (bs - len(blk))
         dec = bytes([blk[j] ^ k_16[j % 16] for j in range(len(blk))])
@@ -868,6 +874,7 @@ def unpack_cbc_xor(ct: bytes, key: bytes, iv: bytes) -> bytes:
 def extract_key_from_kf_bytecode(dec_kf: bytes) -> bytes | None:
     """Extracts the encryption key by evaluating the compiled kf function bytecode."""
     try:
+
         class KeyConstCollector(BytecodePatcher):
             def __init__(self, data: bytes):
                 super().__init__(data)
@@ -969,7 +976,8 @@ def unpack_custom_cbc_packer(data: bytes) -> tuple[bytes, str] | None:
 
         iv = comb_bin[:64]
         total_enc_len = len(comb_bin) - 64 - 32 - padding_len
-        ed = comb_bin[96:96 + total_enc_len]
+        end_ed = 96 + total_enc_len
+        ed = comb_bin[96:end_ed]
 
         deobf = char_deobfuscate(ed)
         rev = reverse_sub(deobf, sk)
@@ -1028,9 +1036,7 @@ def unpack_aes_reflection_packer(data: bytes) -> tuple[bytes, str] | None:
         if pt is None:
             with tempfile.NamedTemporaryFile(
                 suffix=".bin", delete=False
-            ) as f_ct, tempfile.NamedTemporaryFile(
-                suffix=".bin", delete=False
-            ) as f_pt:
+            ) as f_ct, tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f_pt:
                 f_ct.write(ct)
                 f_ct_name, f_pt_name = f_ct.name, f_pt.name
             try:
@@ -1087,16 +1093,10 @@ def deobfuscate_registers(code: str) -> str:
     bindings: dict[str, str] = {}
     tail_regs: set[str] = set()
 
-    re_local_decl = re.compile(
-        r"^\s*local\s+[LA]\d+_\d+(?:,\s*[LA]\d+_\d+)*\s*$"
-    )
+    re_local_decl = re.compile(r"^\s*local\s+[LA]\d+_\d+(?:,\s*[LA]\d+_\d+)*\s*$")
     re_assign = re.compile(r"^(\s*)([LA]\d+_\d+)\s*=\s*(.+)$")
-    re_env_assign = re.compile(
-        r"^(\s*)([LA]\d+_\d+)\.([a-zA-Z_0-9]+)\s*=\s*(.+)$"
-    )
-    re_env_bracket = re.compile(
-        r'^(\s*)([LA]\d+_\d+)\["([a-zA-Z_0-9]+)"\]\s*=\s*(.+)$'
-    )
+    re_env_assign = re.compile(r"^(\s*)([LA]\d+_\d+)\.([a-zA-Z_0-9]+)\s*=\s*(.+)$")
+    re_env_bracket = re.compile(r'^(\s*)([LA]\d+_\d+)\["([a-zA-Z_0-9]+)"\]\s*=\s*(.+)$')
     re_call_stmt = re.compile(r"^(\s*)([LA]\d+_\d+)\((.*)\)\s*$")
     re_multi_call = re.compile(
         r"^(\s*)([LA]\d+_\d+(?:\s*,\s*[LA]\d+_\d+)+)\s*=\s*(.+)$"
@@ -1242,9 +1242,7 @@ def deobfuscate_registers(code: str) -> str:
             continue
 
         # 6. Function definitions: function L1_1(A0_2)
-        m_def = re.match(
-            r"^(\s*)function\s+([a-zA-Z_0-9\.:]+)\s*\((.*)\)\s*$", line
-        )
+        m_def = re.match(r"^(\s*)function\s+([a-zA-Z_0-9\.:]+)\s*\((.*)\)\s*$", line)
         if m_def:
             ind, fname, params = m_def.groups()
             bindings.clear()
@@ -1265,15 +1263,11 @@ def deobfuscate_registers(code: str) -> str:
 
         # 8. Control flow & other statements
         line_res = sub_regs(line)
-        line_res = re.sub(
-            r"if\s+(.+)\s+==\s+true\s+then", r"if \1 then", line_res
-        )
+        line_res = re.sub(r"if\s+(.+)\s+==\s+true\s+then", r"if \1 then", line_res)
         line_res = re.sub(
             r"elseif\s+(.+)\s+==\s+true\s+then", r"elseif \1 then", line_res
         )
-        line_res = re.sub(
-            r"if\s+(.+)\s+==\s+false\s+then", r"if not \1 then", line_res
-        )
+        line_res = re.sub(r"if\s+(.+)\s+==\s+false\s+then", r"if not \1 then", line_res)
         line_res = re.sub(
             r"elseif\s+(.+)\s+==\s+false\s+then",
             r"elseif not \1 then",
@@ -1319,9 +1313,7 @@ def fold_functions(code_str: str) -> str:
 
     while i < len(lines):
         line = lines[i]
-        m_def = re.match(
-            r"^(\s*)function\s+([LA]\d+_\d+)\s*\((.*)\)\s*$", line
-        )
+        m_def = re.match(r"^(\s*)function\s+([LA]\d+_\d+)\s*\((.*)\)\s*$", line)
         if m_def:
             ind, reg, params = m_def.groups()
             depth = 1
@@ -1344,7 +1336,9 @@ def fold_functions(code_str: str) -> str:
                 )
                 if m_assign:
                     real_name = m_assign.group(1)
-                    body_text = fold_functions("\n".join(lines[i + 1:j]))
+                    slice_start = i + 1
+                    body_lines = lines[slice_start:j]
+                    body_text = fold_functions("\n".join(body_lines))
                     out.append(f"{ind}function {real_name}({params})")
                     if body_text:
                         out.append(body_text)
@@ -1430,12 +1424,14 @@ def process_file(file_path: Path, output_path: Path) -> None:
 def process_archive(archive_path: Path, output_dir: Path) -> None:
     print(f"[*] Processing package: {archive_path.name}")
     output_dir.mkdir(parents=True, exist_ok=True)
+    is_gpk = archive_path.suffix.lower() == ".gpk"
     with zipfile.ZipFile(archive_path, "r") as z:
         for info in z.infolist():
             if info.is_dir():
                 continue
             raw_data = z.read(info.filename)
-            target_path = output_dir / info.filename
+            safe_name = info.filename.strip().rstrip(".")
+            target_path = output_dir / safe_name
             target_path.parent.mkdir(parents=True, exist_ok=True)
 
             if info.filename == "init.lua":
@@ -1450,14 +1446,36 @@ def process_archive(archive_path: Path, output_dir: Path) -> None:
                 except UnicodeDecodeError:
                     pass
 
-            if (
-                info.filename.endswith(".lua")
-                or info.filename.endswith(".luac")
-                or info.filename.endswith(".aly")
-            ):
+            if info.filename == "config":
+                try:
+                    text = raw_data.decode("utf-8")
+                    (output_dir / "config.json").write_text(text, encoding="utf-8")
+                    target_path.write_text(text, encoding="utf-8")
+                    print(
+                        f"  [+] {info.filename}: gesture config saved "
+                        f"({len(text.splitlines())} lines)"
+                    )
+                    continue
+                except UnicodeDecodeError:
+                    pass
+
+            is_lua = (
+                info.filename.endswith((".lua", ".luac", ".aly"))
+                or raw_data.startswith(b"\x1bLua")
+                or raw_data.startswith(b"=")
+                or (len(raw_data) > 1 and raw_data[0] == 0x1B and raw_data[1] != 0x4C)
+                or b"load(" in raw_data
+                or b"loadstring(" in raw_data
+                or is_gpk
+            )
+
+            if is_lua:
                 decrypted, dec_method = decrypt_lua_buffer(raw_data)
                 code_text, decomp_method = decompile_lua(decrypted)
-                target_lua = target_path.with_suffix(".lua")
+                if info.filename.endswith((".lua", ".luac", ".aly")):
+                    target_lua = target_path.with_suffix(".lua")
+                else:
+                    target_lua = output_dir / f"{safe_name}.lua"
                 target_lua.write_text(code_text, encoding="utf-8")
                 print(
                     f"  [+] {info.filename}: {dec_method} -> {decomp_method} "
@@ -1476,7 +1494,7 @@ def main():
         )
     )
     parser.add_argument(
-        "input", type=Path, help="Path to .xpk, .ppk, .zip, or .lua file"
+        "input", type=Path, help="Path to .xpk, .ppk, .gpk, .zip, or .lua file"
     )
     parser.add_argument(
         "-o",

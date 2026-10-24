@@ -1,7 +1,7 @@
 # Jieshuo / AndroLua Plugin Decryptor & Decompiler
 أداة فك تشفير وعكس حزم وإضافات قارئ الشاشة جيشوا (Jieshuo / AndroLua) إلى السورس كود الأصلي
 
-أداة سطر أوامر هندسية متقدمة مكتوبة بلغة Python لفك تشفير حزم وإضافات قارئ الشاشة جيشوا بصيغتي `.ppk` و `.xpk`، وعكس البايتكود المترجم (Bytecode) وفك تعمية النصوص والسلاسل البرمجية المتعددة إلى شفرة Lua مصدرية واضحة ونقية ومطابقة للأصل بنسبة 100%.
+أداة سطر أوامر هندسية متقدمة مكتوبة بلغة Python لفك تشفير حزم وإضافات وإيماءات قارئ الشاشة جيشوا بصيغ `.ppk` و `.xpk` و `.gpk` (Gesture Packages)، وعكس البايتكود المترجم (Bytecode) وفك تعمية النصوص والسلاسل البرمجية المتعددة إلى شفرة Lua مصدرية واضحة ونقية ومطابقة للأصل بنسبة 100%.
 
 ---
 
@@ -12,9 +12,10 @@
    - المعادلة الحسابية:
      $$\text{Decrypted}[0] = \text{0x1B}, \quad \text{Decrypted}[i] = \text{Encrypted}[i] \oplus ((i \times \text{Length}) \pmod{255})$$
 
-2. **نمط الحزم المصدرة Base64 + Cumulative XOR + zlib (Exported PPK Packages):**
-   - يُستخدم في الحزم والإضافات المصدرة من بيئة التطبيق الحية والتي تبدأ شفراتها بـ `=`.
+2. **نمط الحزم المصدرة وأغلفة التحميل (Base64 + Cumulative XOR + zlib & Load Wrappers):**
+   - يُستخدم في الحزم المصدرة ومخططات الإيماءات (`.gpk`) وأغلفة الحماية المضمنة عبر `load("=...")` و `loadstring("=...")` و `pcall(load("=..."))`.
    - آلية المعالجة:
+     - استخراج حمولة Base64 المشفرة تلقائياً من داخل دوال التحميل.
      - استبدال حرف `=` بالحرف الأصلي `H` لاستعادة الترويسة `0x1C`.
      - فك تشفير Base64 القياسي.
      - تطبيق فك تعمية XOR التراكمي: $\text{acc} \gets \text{acc} \oplus b$.
@@ -66,10 +67,10 @@ pip install -r requirements.txt
 
 ## الاستخدام (Usage)
 
-### فك وعكس حزمة كاملة (.ppk أو .xpk)
+### فك وعكس حزمة كاملة (.ppk أو .xpk أو .gpk)
 
 ```bash
-python decryptor.py "path/to/package.ppk" -o "path/to/output"
+python decryptor.py "path/to/package.gpk" -o "path/to/output"
 ```
 
 ---

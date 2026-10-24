@@ -4,7 +4,6 @@ __pycache__/
 *.tmp
 *.bin
 *.luac
-output/
-output_unigram/
+output*/
 original_poll/
 test_live/
