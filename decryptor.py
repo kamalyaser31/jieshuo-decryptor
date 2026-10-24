@@ -509,75 +509,123 @@ def find_java() -> str | None:
 def decrypt_lua_buffer(data: bytes) -> tuple[bytes, str]:
     """
     Decodes/decrypts a Lua script buffer from Jieshuo/AndroLua.
+    Recursively peels multi-layer wrappings (Base64 zlib payloads,
+    AndroLua XOR streams, CJK Matrix protectors, XOR stagers, and custom packers).
     Returns: (decrypted_bytes, method_name)
     """
-    if len(data) < 2:
-        return data, "passthrough (too short)"
+    current = data
+    methods: list[str] = []
 
-    if data.startswith(b"\x1bLua"):
-        return data, "plaintext bytecode"
+    for _ in range(10):
+        if len(current) < 2:
+            break
 
-    if data[0] == 0x1B and data[1] != 0x4C:
-        length = len(data)
-        out = bytearray(length)
-        out[0] = 0x1B
-        for i in range(1, length):
-            k = (i * length) % 255
-            out[i] = data[i] ^ k
-        if out.startswith(b"\x1bLua"):
-            return bytes(out), "AndroLua XOR Stream (0x1B)"
-        return bytes(out), "AndroLua XOR Stream (raw)"
+        # 1. Check load/loadstring wrappers
+        m_load = re.search(
+            rb'(?:load|loadstring)\s*\(\s*(?:["\']|\[=*\[)\s*(=[A-Za-z0-9+/=]+)',
+            current,
+        )
+        if m_load:
+            current = m_load.group(1)
+            methods.append("load wrapper")
+            continue
 
-    if data.startswith(b"="):
-        payloads = [b"H" + data[1:].strip(), data[1:].strip()]
-        for raw_b64 in payloads:
-            rem = len(raw_b64) % 4
-            if rem != 0:
-                raw_b64 += b"=" * (4 - rem)
-            try:
-                decoded = base64.b64decode(raw_b64)
-                if len(decoded) > 0 and decoded[0] == 0x1C:
-                    acc = 0
-                    buf = bytearray()
-                    for b in decoded:
-                        acc ^= b
-                        buf.append(acc)
-                    buf[0] = 0x78
-                    try:
-                        decomp = bytearray(zlib.decompress(bytes(buf)))
-                        if decomp.startswith(b"\x1cLua"):
-                            decomp[0] = 0x1B
-                        return bytes(decomp), "Base64 (=H) + Cumulative XOR + zlib"
-                    except Exception:
-                        pass
-                if decoded.startswith(b"\x1bLua") or all(
-                    32 <= c <= 126 or c in (9, 10, 13) for c in decoded[:50]
-                ):
-                    return decoded, "Base64 Direct Payload"
-            except Exception:
+        # 2. Check Base64 (=H or direct) + Cumulative XOR + zlib
+        if current.startswith(b"="):
+            payloads = [b"H" + current[1:].strip(), current[1:].strip()]
+            unpacked = None
+            for raw_b64 in payloads:
+                rem = len(raw_b64) % 4
+                if rem != 0:
+                    raw_b64 += b"=" * (4 - rem)
+                try:
+                    decoded = base64.b64decode(raw_b64)
+                    if len(decoded) > 0 and decoded[0] == 0x1C:
+                        acc = 0
+                        buf = bytearray()
+                        for b in decoded:
+                            acc ^= b
+                            buf.append(acc)
+                        buf[0] = 0x78
+                        try:
+                            decomp = bytearray(zlib.decompress(bytes(buf)))
+                            if decomp.startswith(b"\x1cLua"):
+                                decomp[0] = 0x1B
+                            unpacked = bytes(decomp)
+                            methods.append("Base64 (=H) + Cumulative XOR + zlib")
+                            break
+                        except Exception:
+                            pass
+                    if decoded.startswith(b"\x1bLua") or all(
+                        32 <= c <= 126 or c in (9, 10, 13) for c in decoded[:50]
+                    ):
+                        unpacked = decoded
+                        methods.append("Base64 Direct Payload")
+                        break
+                except Exception:
+                    continue
+            if unpacked is not None:
+                current = unpacked
                 continue
 
-    m_load = re.search(
-        rb'(?:load|loadstring)\s*\(\s*(?:["\']|\[=*\[)\s*(=[A-Za-z0-9+/=]+)',
-        data,
-    )
-    if m_load:
-        dec, m_name = decrypt_lua_buffer(m_load.group(1))
-        return dec, f"load wrapper -> {m_name}"
+        # 3. Check AndroLua XOR stream (0x1B)
+        if len(current) > 1 and current[0] == 0x1B and current[1] != 0x4C:
+            length = len(current)
+            out = bytearray(length)
+            out[0] = 0x1B
+            for i in range(1, length):
+                k = (i * length) % 255
+                out[i] = current[i] ^ k
+            methods.append("AndroLua XOR Stream (0x1B)")
+            current = bytes(out)
+            continue
 
-    res = unpack_decimal_array_packer(data)
-    if res:
-        return res
+        # 4. Check Jieshuo CJK Matrix Protector (bytecode)
+        res_cjk = unpack_cjk_protector(current)
+        if res_cjk is not None:
+            cjk_bytes, cjk_name = res_cjk
+            methods.append(cjk_name)
+            current = cjk_bytes
+            continue
 
-    res = unpack_custom_cbc_packer(data)
-    if res:
-        return res
+        # 5. Check Lua XOR Stager (bytecode)
+        res_stg = unpack_xor_stager(current)
+        if res_stg is not None:
+            stg_bytes, stg_name = res_stg
+            methods.append(stg_name)
+            current = stg_bytes
+            continue
 
-    res = unpack_aes_reflection_packer(data)
-    if res:
-        return res
+        # 6. Check custom packers
+        res_p = unpack_decimal_array_packer(current)
+        if res_p is not None:
+            p_bytes, p_meth = res_p
+            methods.append(p_meth)
+            current = p_bytes
+            continue
 
-    return data, "plaintext"
+        res_p = unpack_custom_cbc_packer(current)
+        if res_p is not None:
+            p_bytes, p_meth = res_p
+            methods.append(p_meth)
+            current = p_bytes
+            continue
+
+        res_p = unpack_aes_reflection_packer(current)
+        if res_p is not None:
+            p_bytes, p_meth = res_p
+            methods.append(p_meth)
+            current = p_bytes
+            continue
+
+        break
+
+    if not methods:
+        if current.startswith(b"\x1bLua"):
+            return current, "plaintext bytecode"
+        return current, "plaintext"
+
+    return current, " -> ".join(methods)
 
 
 def score_candidate(cand_bytes: bytes, raw_bytes: bytes) -> float:
@@ -1068,6 +1116,139 @@ def unpack_aes_reflection_packer(data: bytes) -> tuple[bytes, str] | None:
     except Exception:
         pass
     return None
+
+
+def unpack_cjk_protector(data: bytes) -> tuple[bytes, str] | None:
+    """Unpacks Chinese CJK Matrix Protector (解说代码加密 / 禁止进入程序!)."""
+    if not data.startswith(b"\x1bLua"):
+        return None
+    try:
+        p = BytecodePatcher(data)
+        p.parse_header()
+
+        def read_raw_str(p_obj: BytecodePatcher) -> bytes:
+            b = p_obj.read_u8()
+            if b == 0:
+                return b""
+            elif b == 0xFF:
+                sz = p_obj.read_sizet()
+            else:
+                sz = b
+            return p_obj.read_bytes(sz - 1)
+
+        read_raw_str(p)
+        p.read_cint()
+        p.read_cint()
+        p.read_u8()
+        p.read_u8()
+        p.read_u8()
+        sizecode = p.read_cint()
+        p.pos += sizecode * p.inst_size
+        sizek = p.read_cint()
+        raw_strings: list[bytes] = []
+        for _ in range(sizek):
+            t = p.read_u8()
+            if t in (4, 0x14):
+                raw_strings.append(read_raw_str(p))
+
+        if not raw_strings:
+            return None
+
+        enc = max(raw_strings, key=len)
+        if len(enc) < 300:
+            return None
+
+        length = len(enc)
+        best_step = -1
+        best_cnt = 0
+        sample_len = min(length, 300)
+        for step in range(256):
+            key = [length % 255]
+            for _ in range(1, sample_len):
+                key.append((key[-1] + step) % 255)
+            cand_sample = bytes([enc[i] ^ key[i] for i in range(sample_len)])
+            cjk = sum(
+                1
+                for i in range(0, sample_len - 2, 3)
+                if (0xE4 <= cand_sample[i] <= 0xE9)
+                and (0x80 <= cand_sample[i + 1] <= 0xBF)
+                and (0x80 <= cand_sample[i + 2] <= 0xBF)
+            )
+            if cjk > best_cnt:
+                best_cnt = cjk
+                best_step = step
+
+        if best_cnt < 20 or best_step == -1:
+            return None
+
+        full_key = [length % 255]
+        for _ in range(1, length):
+            full_key.append((full_key[-1] + best_step) % 255)
+
+        cand = bytes([enc[i] ^ full_key[i] for i in range(length)])
+        vals: list[int] = []
+        for i in range(0, len(cand) - 2, 3):
+            b1, b2, b3 = cand[i], cand[i + 1], cand[i + 2]
+            cp = (b1 - 224) * 4096 + (b2 - 128) * 64 + (b3 - 128)
+            vals.append((cp - 19968) % 256)
+
+        if not vals:
+            return None
+
+        kb = vals[0]
+        decoded = bytes(
+            [(vals[j] ^ (kb + (j % 32))) % 256 for j in range(1, len(vals))]
+        )
+        return decoded, f"CJK Protector (step {best_step})"
+    except Exception:
+        return None
+
+
+def unpack_xor_stager(data: bytes) -> tuple[bytes, str] | None:
+    """Unpacks Lua two-string repeating XOR stager."""
+    if not data.startswith(b"\x1bLua"):
+        return None
+    try:
+        p = BytecodePatcher(data)
+        p.parse_header()
+
+        def read_raw_str(p_obj: BytecodePatcher) -> bytes:
+            b = p_obj.read_u8()
+            if b == 0:
+                return b""
+            elif b == 0xFF:
+                sz = p_obj.read_sizet()
+            else:
+                sz = b
+            return p_obj.read_bytes(sz - 1)
+
+        read_raw_str(p)
+        p.read_cint()
+        p.read_cint()
+        p.read_u8()
+        p.read_u8()
+        p.read_u8()
+        sizecode = p.read_cint()
+        p.pos += sizecode * p.inst_size
+        sizek = p.read_cint()
+        raw_strings: list[bytes] = []
+        for _ in range(sizek):
+            t = p.read_u8()
+            if t in (4, 0x14):
+                raw_strings.append(read_raw_str(p))
+
+        if len(raw_strings) < 2:
+            return None
+
+        k0, k1 = raw_strings[0], raw_strings[1]
+        if len(k0) > 200 and len(k1) < 200:
+            s_k0 = solve_string(k0)
+            s_k1 = solve_string(k1)
+            payload = bytes([s_k0[i] ^ s_k1[i % len(s_k1)] for i in range(len(s_k0))])
+            return payload, "Lua XOR Stager"
+        return None
+    except Exception:
+        return None
 
 
 def unescape_lua_string(code: str) -> str:
