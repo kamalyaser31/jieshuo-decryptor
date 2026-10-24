@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.tmp
+*.bin
+*.luac
+output/
+output_unigram/
+original_poll/
+test_live/

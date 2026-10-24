@@ -1,0 +1,2 @@
+# Jieshuo / AndroLua Plugin Decryptor & Decompiler
+cryptography>=41.0.0
