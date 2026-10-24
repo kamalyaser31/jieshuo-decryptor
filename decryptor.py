@@ -588,8 +588,15 @@ def decrypt_lua_buffer(data: bytes) -> tuple[bytes, str]:
             current = cjk_bytes
             continue
 
-        # 5. Check Lua XOR Stager (bytecode)
+        # 5. Check Lua XOR Stagers (bytecode)
         res_stg = unpack_xor_stager(current)
+        if res_stg is not None:
+            stg_bytes, stg_name = res_stg
+            methods.append(stg_name)
+            current = stg_bytes
+            continue
+
+        res_stg = unpack_modulo_stager(current)
         if res_stg is not None:
             stg_bytes, stg_name = res_stg
             methods.append(stg_name)
@@ -1246,6 +1253,77 @@ def unpack_xor_stager(data: bytes) -> tuple[bytes, str] | None:
             s_k1 = solve_string(k1)
             payload = bytes([s_k0[i] ^ s_k1[i % len(s_k1)] for i in range(len(s_k0))])
             return payload, "Lua XOR Stager"
+        return None
+    except Exception:
+        return None
+
+
+def unpack_modulo_stager(data: bytes) -> tuple[bytes, str] | None:
+    """Unpacks Lua modulo XOR stager: (s[i] ^ k_xor) ^ ((i + 1) % k_mod)."""
+    if not data.startswith(b"\x1bLua"):
+        return None
+    try:
+        p = BytecodePatcher(data)
+        p.parse_header()
+
+        def read_raw_str(p_obj: BytecodePatcher) -> bytes:
+            b = p_obj.read_u8()
+            if b == 0:
+                return b""
+            elif b == 0xFF:
+                sz = p_obj.read_sizet()
+            else:
+                sz = b
+            return p_obj.read_bytes(sz - 1)
+
+        read_raw_str(p)
+        p.read_cint()
+        p.read_cint()
+        p.read_u8()
+        p.read_u8()
+        p.read_u8()
+        sizecode = p.read_cint()
+        p.pos += sizecode * p.inst_size
+        sizek = p.read_cint()
+        k_ints: list[int] = []
+        k_strs: list[bytes] = []
+        for _ in range(sizek):
+            t = p.read_u8()
+            if t in (4, 0x14):
+                raw_s = read_raw_str(p)
+                if len(raw_s) > 1000:
+                    k_strs.append(raw_s)
+            elif t in (3, 0x13):
+                val = struct.unpack("<q", p.read_bytes(8))[0]
+                k_ints.append(val)
+            elif t == 1:
+                p.read_u8()
+
+        if not k_strs or len(k_ints) < 2:
+            return None
+
+        for payload in k_strs:
+            for k_xor in k_ints:
+                for k_mod in k_ints:
+                    if k_mod <= 0 or k_mod > 1000:
+                        continue
+                    pt = bytes(
+                        [
+                            (payload[i] ^ k_xor) ^ ((i + 1) % k_mod)
+                            for i in range(min(50, len(payload)))
+                        ]
+                    )
+                    if pt.startswith(b"=") or pt.startswith(b"load") or b"import" in pt:
+                        full_pt = bytes(
+                            [
+                                (payload[i] ^ k_xor) ^ ((i + 1) % k_mod)
+                                for i in range(len(payload))
+                            ]
+                        )
+                        return (
+                            full_pt,
+                            f"Lua Modulo XOR Stager (xor={k_xor}, mod={k_mod})",
+                        )
         return None
     except Exception:
         return None
