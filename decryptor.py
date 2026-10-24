@@ -530,6 +530,86 @@ def decrypt_lua_buffer(data: bytes) -> tuple[bytes, str]:
             methods.append("load wrapper")
             continue
 
+        # 1b. Check text-level nested Lua XOR stagers (local S=...; local E="...";)
+        m_s = re.search(
+            rb'local\s+S\s*=\s*(\d+);\s*local\s+E\s*=\s*"((?:[^"\\]|\\.)*)";',
+            current,
+        )
+        if m_s:
+            salt = int(m_s.group(1))
+            e_raw = m_s.group(2)
+            out_e = bytearray()
+            pos = 0
+            while pos < len(e_raw):
+                b = e_raw[pos]
+                if b == 92:
+                    pos += 1
+                    m_d = re.match(rb"(\d{1,3})", e_raw[pos:])
+                    if m_d:
+                        out_e.append(int(m_d.group(1)))
+                        pos += len(m_d.group(1))
+                    elif pos < len(e_raw) and e_raw[pos] == 92:
+                        out_e.append(92)
+                        pos += 1
+                    elif pos < len(e_raw) and e_raw[pos] == 34:
+                        out_e.append(34)
+                        pos += 1
+                    elif pos < len(e_raw):
+                        out_e.append(e_raw[pos])
+                        pos += 1
+                else:
+                    out_e.append(b)
+                    pos += 1
+            decoded = bytes(
+                [out_e[i] ^ ((salt + ((i + 1) % 32)) % 256) for i in range(len(out_e))]
+            )
+            methods.append(f"Nested Lua XOR Stager (salt={salt})")
+            current = decoded
+            continue
+
+        # 1c. Check decimal-escaped load wrapper (_ENV or _G)["\108\111\097\100"]("...")
+        if b"\\108\\111\\097\\100" in current or b"\\108\\111\\97\\100" in current:
+            m_wrapper = re.search(rb'\("((?:[^"\\]|\\.)*)"\)', current)
+            if m_wrapper:
+                arg_bytes = m_wrapper.group(1)
+                out_arg = bytearray()
+                pos = 0
+                while pos < len(arg_bytes):
+                    b = arg_bytes[pos]
+                    if b == 92:
+                        pos += 1
+                        if pos >= len(arg_bytes):
+                            break
+                        nxt = arg_bytes[pos]
+                        if 48 <= nxt <= 57:
+                            m_d = re.match(rb"(\d{1,3})", arg_bytes[pos:])
+                            out_arg.append(int(m_d.group(1)))
+                            pos += len(m_d.group(1))
+                        elif nxt == 110:
+                            out_arg.append(10)
+                            pos += 1
+                        elif nxt == 114:
+                            out_arg.append(13)
+                            pos += 1
+                        elif nxt == 116:
+                            out_arg.append(9)
+                            pos += 1
+                        elif nxt == 92:
+                            out_arg.append(92)
+                            pos += 1
+                        elif nxt == 34:
+                            out_arg.append(34)
+                            pos += 1
+                        else:
+                            out_arg.append(nxt)
+                            pos += 1
+                    else:
+                        out_arg.append(b)
+                        pos += 1
+                methods.append("Decimal-Escaped Load Wrapper")
+                current = bytes(out_arg)
+                continue
+
         # 2. Check Base64 (=H or direct) + Cumulative XOR + zlib
         if current.startswith(b"="):
             payloads = [b"H" + current[1:].strip(), current[1:].strip()]
@@ -549,7 +629,7 @@ def decrypt_lua_buffer(data: bytes) -> tuple[bytes, str]:
                         buf[0] = 0x78
                         try:
                             decomp = bytearray(zlib.decompress(bytes(buf)))
-                            if decomp.startswith(b"\x1cLua"):
+                            if len(decomp) >= 4 and decomp[1:4] == b"Lua":
                                 decomp[0] = 0x1B
                             unpacked = bytes(decomp)
                             methods.append("Base64 (=H) + Cumulative XOR + zlib")
@@ -1125,39 +1205,132 @@ def unpack_aes_reflection_packer(data: bytes) -> tuple[bytes, str] | None:
     return None
 
 
+class Lua53Reader:
+    """Robust Lua 5.3 bytecode constant and structure parser."""
+
+    def __init__(self, data: bytes):
+        self.data = data
+        self.pos = 0
+        self.cint_size = 4
+        self.sizet_size = 8
+        self.inst_size = 4
+        self.lua_int_size = 8
+        self.lua_num_size = 8
+
+    def read_bytes(self, n: int) -> bytes:
+        start = self.pos
+        end = start + n
+        res = self.data[start:end]
+        self.pos = end
+        return res
+
+    def read_u8(self) -> int:
+        return self.read_bytes(1)[0]
+
+    def read_cint(self) -> int:
+        fmt = "<i" if self.cint_size == 4 else "<q"
+        return struct.unpack(fmt, self.read_bytes(self.cint_size))[0]
+
+    def read_sizet(self) -> int:
+        fmt = "<I" if self.sizet_size == 4 else "<Q"
+        return struct.unpack(fmt, self.read_bytes(self.sizet_size))[0]
+
+    def read_lua_int(self) -> int:
+        fmt = "<q" if self.lua_int_size == 8 else "<i"
+        return struct.unpack(fmt, self.read_bytes(self.lua_int_size))[0]
+
+    def read_lua_num(self) -> float:
+        fmt = "<d" if self.lua_num_size == 8 else "<f"
+        return struct.unpack(fmt, self.read_bytes(self.lua_num_size))[0]
+
+    def read_str(self) -> bytes:
+        b = self.read_u8()
+        if b == 0:
+            return b""
+        elif b == 0xFF:
+            sz = self.read_sizet()
+        else:
+            sz = b
+        return self.read_bytes(sz - 1)
+
+    def parse_header(self) -> None:
+        magic = self.read_bytes(4)
+        if magic != b"\x1bLua":
+            raise ValueError("Invalid Lua bytecode header")
+        self.read_u8()  # version
+        self.read_u8()  # format
+        self.read_bytes(6)  # luac_data
+        self.cint_size = self.read_u8()
+        self.sizet_size = self.read_u8()
+        self.inst_size = self.read_u8()
+        self.lua_int_size = self.read_u8()
+        self.lua_num_size = self.read_u8()
+        self.read_bytes(self.lua_int_size)
+        self.read_bytes(self.lua_num_size)
+        self.read_u8()  # upvalues
+
+    def parse_proto(self) -> dict:
+        self.read_str()  # source
+        self.read_cint()  # linedefined
+        self.read_cint()  # lastlinedefined
+        self.read_u8()  # numparams
+        self.read_u8()  # is_vararg
+        self.read_u8()  # maxstacksize
+
+        sizecode = self.read_cint()
+        self.pos += sizecode * self.inst_size
+
+        sizek = self.read_cint()
+        k: list = []
+        for _ in range(sizek):
+            t = self.read_u8()
+            if t == 0:
+                k.append(None)
+            elif t == 1:
+                k.append(bool(self.read_u8()))
+            elif t in (3, 0x13):
+                if t == 3:
+                    k.append(self.read_lua_num())
+                else:
+                    k.append(self.read_lua_int())
+            elif t in (4, 0x14):
+                k.append(self.read_str())
+            else:
+                raise ValueError(f"Unknown const type: {t}")
+
+        sizeup = self.read_cint()
+        self.pos += sizeup * 2
+        return {"k": k}
+
+
 def unpack_cjk_protector(data: bytes) -> tuple[bytes, str] | None:
     """Unpacks Chinese CJK Matrix Protector (解说代码加密 / 禁止进入程序!)."""
+    # 1. Check Text Lua representation
+    m_text = re.search(rb'local\s+_l\s*=\s*"([^"]+)"', data)
+    if m_text:
+        l_bytes = m_text.group(1)
+        if len(l_bytes) >= 6:
+            s1, s2, s3 = l_bytes[0], l_bytes[1], l_bytes[2]
+            salt = ((s1 - 224) * 4096 + (s2 - 128) * 64 + (s3 - 128) - 19968) % 256
+            out = bytearray()
+            idx = 1
+            for i in range(3, len(l_bytes) - 2, 3):
+                b1, b2, b3 = l_bytes[i], l_bytes[i + 1], l_bytes[i + 2]
+                cp = (b1 - 224) * 4096 + (b2 - 128) * 64 + (b3 - 128)
+                val = (cp - 19968) % 256
+                xor_key = (salt + (idx % 32)) % 256
+                out.append(val ^ xor_key)
+                idx += 1
+            return bytes(out), "CJK Protector (Text Lua)"
+
+    # 2. Check compiled Lua bytecode representation
     if not data.startswith(b"\x1bLua"):
         return None
     try:
-        p = BytecodePatcher(data)
-        p.parse_header()
-
-        def read_raw_str(p_obj: BytecodePatcher) -> bytes:
-            b = p_obj.read_u8()
-            if b == 0:
-                return b""
-            elif b == 0xFF:
-                sz = p_obj.read_sizet()
-            else:
-                sz = b
-            return p_obj.read_bytes(sz - 1)
-
-        read_raw_str(p)
-        p.read_cint()
-        p.read_cint()
-        p.read_u8()
-        p.read_u8()
-        p.read_u8()
-        sizecode = p.read_cint()
-        p.pos += sizecode * p.inst_size
-        sizek = p.read_cint()
-        raw_strings: list[bytes] = []
-        for _ in range(sizek):
-            t = p.read_u8()
-            if t in (4, 0x14):
-                raw_strings.append(read_raw_str(p))
-
+        reader = Lua53Reader(data)
+        reader.parse_header()
+        main_proto = reader.parse_proto()
+        raw_strings = [c for c in main_proto["k"] if isinstance(c, bytes)]
         if not raw_strings:
             return None
 
@@ -1166,47 +1339,78 @@ def unpack_cjk_protector(data: bytes) -> tuple[bytes, str] | None:
             return None
 
         length = len(enc)
-        best_step = -1
-        best_cnt = 0
-        sample_len = min(length, 300)
-        for step in range(256):
-            key = [length % 255]
-            for _ in range(1, sample_len):
-                key.append((key[-1] + step) % 255)
-            cand_sample = bytes([enc[i] ^ key[i] for i in range(sample_len)])
-            cjk = sum(
-                1
-                for i in range(0, sample_len - 2, 3)
-                if (0xE4 <= cand_sample[i] <= 0xE9)
-                and (0x80 <= cand_sample[i + 1] <= 0xBF)
-                and (0x80 <= cand_sample[i + 2] <= 0xBF)
-            )
-            if cjk > best_cnt:
-                best_cnt = cjk
-                best_step = step
-
-        if best_cnt < 20 or best_step == -1:
-            return None
-
-        full_key = [length % 255]
-        for _ in range(1, length):
-            full_key.append((full_key[-1] + best_step) % 255)
+        dec_0 = enc[0] ^ (length % 255)
+        full_key = bytearray(length)
+        full_key[0] = length % 255
+        if length > 40:
+            w8 = length
+            step = (dec_0 + length) & 0xFFFFFFFF
+            for i in range(1, length):
+                w8 = (w8 + step) & 0xFFFFFFFF
+                s_w8 = w8 if w8 < 0x80000000 else w8 - 0x100000000
+                q = int(s_w8 / 255)
+                full_key[i] = (w8 + q) & 0xFF
+        else:
+            k = length % 255
+            step = (dec_0 + length) % 255
+            for i in range(1, length):
+                k = (k + step) % 255
+                full_key[i] = k
 
         cand = bytes([enc[i] ^ full_key[i] for i in range(length)])
-        vals: list[int] = []
-        for i in range(0, len(cand) - 2, 3):
-            b1, b2, b3 = cand[i], cand[i + 1], cand[i + 2]
-            cp = (b1 - 224) * 4096 + (b2 - 128) * 64 + (b3 - 128)
-            vals.append((cp - 19968) % 256)
 
-        if not vals:
-            return None
+        # 2a. Check if this is genuine CJK Matrix protector:
+        sample_len = min(len(cand) // 3, 30)
+        cjk_ok = 0
+        for k in range(sample_len):
+            cb1, cb2, cb3 = cand[k * 3], cand[k * 3 + 1], cand[k * 3 + 2]
+            if 0xE4 <= cb1 <= 0xE9 and 0x80 <= cb2 <= 0xBF and 0x80 <= cb3 <= 0xBF:
+                cjk_ok += 1
+        if sample_len >= 5 and cjk_ok >= sample_len * 0.8:
+            b1, b2, b3 = cand[0], cand[1], cand[2]
+            cp0 = (b1 - 224) * 4096 + (b2 - 128) * 64 + (b3 - 128)
+            kb = (cp0 - 19968) % 256
 
-        kb = vals[0]
-        decoded = bytes(
-            [(vals[j] ^ (kb + (j % 32))) % 256 for j in range(1, len(vals))]
+            plain = bytearray()
+            j = 1
+            for i in range(3, length - 2, 3):
+                c1, c2, c3 = cand[i], cand[i + 1], cand[i + 2]
+                cp = (c1 - 224) * 4096 + (c2 - 128) * 64 + (c3 - 128)
+                val = (cp - 19968) % 256
+                xor_key = (kb + (j % 32)) % 256
+                plain.append(val ^ xor_key)
+                j += 1
+
+            return bytes(plain), f"CJK Protector (length {length})"
+
+        # 2b. Check for Jieshuo Bytecode XOR Stager:
+        candidate_salts = [
+            c for c in main_proto["k"] if isinstance(c, int) and 0 < c < 256
+        ]
+        b64_chars = set(
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
         )
-        return decoded, f"CJK Protector (step {best_step})"
+        for salt in candidate_salts:
+            check_len = min(50, len(cand))
+            plain = bytes(
+                [cand[i] ^ ((salt + ((i + 1) % 32)) % 256) for i in range(check_len)]
+            )
+            if (
+                plain.startswith(b"=")
+                and all(c in b64_chars for c in plain[1:check_len])
+            ) or any(
+                plain.startswith(p)
+                for p in (b"load", b"import", b"\x1bLua", b"(_ENV", b"local ")
+            ):
+                full_plain = bytes(
+                    [
+                        cand[i] ^ ((salt + ((i + 1) % 32)) % 256)
+                        for i in range(len(cand))
+                    ]
+                )
+                return full_plain, f"Jieshuo Bytecode XOR Stager (salt={salt})"
+
+        return None
     except Exception:
         return None
 
@@ -1263,66 +1467,55 @@ def unpack_modulo_stager(data: bytes) -> tuple[bytes, str] | None:
     if not data.startswith(b"\x1bLua"):
         return None
     try:
-        p = BytecodePatcher(data)
-        p.parse_header()
-
-        def read_raw_str(p_obj: BytecodePatcher) -> bytes:
-            b = p_obj.read_u8()
-            if b == 0:
-                return b""
-            elif b == 0xFF:
-                sz = p_obj.read_sizet()
-            else:
-                sz = b
-            return p_obj.read_bytes(sz - 1)
-
-        read_raw_str(p)
-        p.read_cint()
-        p.read_cint()
-        p.read_u8()
-        p.read_u8()
-        p.read_u8()
-        sizecode = p.read_cint()
-        p.pos += sizecode * p.inst_size
-        sizek = p.read_cint()
-        k_ints: list[int] = []
-        k_strs: list[bytes] = []
-        for _ in range(sizek):
-            t = p.read_u8()
-            if t in (4, 0x14):
-                raw_s = read_raw_str(p)
-                if len(raw_s) > 1000:
-                    k_strs.append(raw_s)
-            elif t in (3, 0x13):
-                val = struct.unpack("<q", p.read_bytes(8))[0]
-                k_ints.append(val)
-            elif t == 1:
-                p.read_u8()
+        reader = Lua53Reader(data)
+        reader.parse_header()
+        main_proto = reader.parse_proto()
+        k_ints = [c for c in main_proto["k"] if isinstance(c, int)]
+        k_strs = [c for c in main_proto["k"] if isinstance(c, bytes) and len(c) > 1000]
 
         if not k_strs or len(k_ints) < 2:
             return None
+
+        b64_chars = set(
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+        )
 
         for payload in k_strs:
             for k_xor in k_ints:
                 for k_mod in k_ints:
                     if k_mod <= 0 or k_mod > 1000:
                         continue
+                    check_len = min(100, len(payload))
+                    k_xor_b = k_xor % 256
                     pt = bytes(
                         [
-                            (payload[i] ^ k_xor) ^ ((i + 1) % k_mod)
-                            for i in range(min(50, len(payload)))
+                            ((payload[i] ^ k_xor_b) ^ ((i + 1) % k_mod)) % 256
+                            for i in range(check_len)
                         ]
                     )
-                    if pt.startswith(b"=") or pt.startswith(b"load") or b"import" in pt:
+                    if pt.startswith(b"=") and all(
+                        c in b64_chars for c in pt[1:check_len]
+                    ):
                         full_pt = bytes(
                             [
-                                (payload[i] ^ k_xor) ^ ((i + 1) % k_mod)
+                                ((payload[i] ^ k_xor_b) ^ ((i + 1) % k_mod)) % 256
                                 for i in range(len(payload))
                             ]
                         )
                         return (
                             full_pt,
-                            f"Lua Modulo XOR Stager (xor={k_xor}, mod={k_mod})",
+                            f"Lua Modulo XOR Stager (xor={k_xor_b}, mod={k_mod})",
+                        )
+                    elif pt.startswith(b"load") or b"import" in pt:
+                        full_pt = bytes(
+                            [
+                                ((payload[i] ^ k_xor_b) ^ ((i + 1) % k_mod)) % 256
+                                for i in range(len(payload))
+                            ]
+                        )
+                        return (
+                            full_pt,
+                            f"Lua Modulo XOR Stager (xor={k_xor_b}, mod={k_mod})",
                         )
         return None
     except Exception:
